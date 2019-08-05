@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+set -eu
+
+
+# shellfunc
+source /cathedral/src/lib/shellfunc
+
+
+# variable variables
+delay="$DELAY"
+
+
+# printing
+if ! tput sgr0 >/dev/null 2>&1; then
+	export TERM="xterm"
+fi
+color_reset="$(tput sgr0)"
+color_white="${color_reset}$(tput bold)$(tput setaf 7)"
+color_green="${color_reset}$(tput setaf 2)"
+color_yellow="${color_reset}$(tput bold)$(tput setaf 3)"
+color_red="${color_reset}$(tput bold)$(tput setaf 1)"
+function log { printf '%s\n' "$*" >&2; }
+function step { log "${color_white}==> ${color_yellow}$*${color_reset}"; }
+function yell { log "${color_white}$*${color_reset}"; }
+function error { log "${color_red}$*${color_reset}"; }
+
+
+# sanity
+error=false
+paths=(
+	"/var/run/docker.sock"
+	"/var/run/dbus"
+	"/run/avahi-daemon"
+)
+for path in "${paths[@]}"; do
+	if ! [[ -e "$path" ]]; then
+		error "Missing mount point: $path"
+		error=true
+	fi
+done
+read -r ipcount < <(ip address | grep -Ec "inet6?")
+if (( ipcount < 3 )); then
+	error "Found suspiciously few IP addresses on the system - did you forget '--network host'?"
+	error=true
+fi
+if $error; then
+	error "Here's a suggested line to deploy swarm-glue on a Debian based system:"
+	log "$ docker pull b01t/swarm-glue:armhf && docker run -d --name swarm-glue --restart unless-stopped -v /var/run/docker.sock:/var/run/docker.sock -v /var/run/dbus:/var/run/dbus -v /run/avahi-daemon:/run/avahi-daemon --network host -v swarm-glue:/mnt/data b01t/swarm-glue:armhf"
+	exit 1
+fi
+
+
+# loop
+while true; do
+	step "Applying swarm glue"
+	yell "$(sf_timestamp)"
+	glue && code=$? || code=$?
+	yell "Glue exit code: $code"
+	yell "Sleeping for ${delay} seconds"
+	sleep "$delay" || exit $?
+done
+
+
+
+# vim: tabstop=4:softtabstop=4:shiftwidth=4:noexpandtab
