@@ -27,8 +27,8 @@ docker run -d --restart unless-stopped \
   -v /var/run/docker.sock:/var/run/docker.sock \
   -v /var/run/dbus:/var/run/dbus \
   -v /run/avahi-daemon:/run/avahi-daemon \
-  --hostname "$(hostname -s)" \
   -v swarm-glue:/mnt/data \
+  --hostname "$(hostname -s)" \
   --network host \
   --name swarm-glue \
   b01t/swarm-glue
@@ -40,8 +40,8 @@ docker run -d --restart unless-stopped \
   -v /var/run/docker.sock:/var/run/docker.sock \
   -v /var/run/dbus:/var/run/dbus \
   -v /run/avahi-daemon:/run/avahi-daemon \
-  --hostname "$(hostname -s)" \
   -v swarm-glue:/mnt/data \
+  --hostname "$(hostname -s)" \
   --network host \
   --name swarm-glue \
   b01t/swarm-glue:armhf
