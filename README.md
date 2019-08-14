@@ -27,7 +27,6 @@ docker run -d --restart unless-stopped \
   -v /var/run/docker.sock:/var/run/docker.sock \
   -v /var/run/dbus:/var/run/dbus \
   -v /run/avahi-daemon:/run/avahi-daemon \
-  -v /var/run/systemd:/var/run/systemd \
   --hostname "$(hostname -s)" \
   -v swarm-glue:/mnt/data \
   --network host \
@@ -41,7 +40,6 @@ docker run -d --restart unless-stopped \
   -v /var/run/docker.sock:/var/run/docker.sock \
   -v /var/run/dbus:/var/run/dbus \
   -v /run/avahi-daemon:/run/avahi-daemon \
-  -v /var/run/systemd:/var/run/systemd \
   --hostname "$(hostname -s)" \
   -v swarm-glue:/mnt/data \
   --network host \
