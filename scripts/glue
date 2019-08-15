@@ -86,6 +86,8 @@ function join-token-remote-manager
 				join_cmd_ip_regex=${join_cmd_ip_regex@Q}
 				$(declare -f println)
 				$(declare -f error)
+				$(declare -f log)
+				$(declare -f log-inline)
 				$(declare -f iplist)
 				$(declare -f join-token)
 				join-token manager
@@ -784,6 +786,7 @@ function remote_access
 		docker node ls --format "{{ .Hostname }}${fs}{{ .Status }}" |
 		grep "${fs}Ready$" |
 		cut -d "$fs" -f 1 |
+		grep -v "^${hostname}$" |
 		sort | uniq
 	)
 }
