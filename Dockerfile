@@ -1,6 +1,6 @@
 # define
 ARG BASE_TAG
-FROM registry:1337/base/docker:${BASE_TAG}
+FROM b01t/docker:${BASE_TAG}
 LABEL maintainer "bolt@dhampir.no"
 
 
