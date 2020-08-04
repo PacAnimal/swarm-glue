@@ -1,38 +1,26 @@
 # define
-FROM debian:buster-slim
+ARG BASE_TAG
+FROM registry:1337/base/docker:${BASE_TAG}
 LABEL maintainer "bolt@dhampir.no"
 
-SHELL ["/bin/bash", "-c"]
 
 # required runtime
 RUN set -eux                                                            &&  \
     export TERM=dumb DEBIAN_FRONTEND=noninteractive                     &&  \
     apt-get update                                                      &&  \
-    apt-get install -y                                                      \
-        bash                                                                \
-        curl                                                                \
+    apt-get install -y --no-install-recommends                              \
+        jq                                                                  \
         timelimit                                                           \
         openssh-client                                                      \
         iproute2                                                            \
+        uuid-runtime                                                        \
         avahi-utils                                                     &&  \
-
-# docker
-	curl -fsSL https://get.docker.com -o /tmp/get-docker.sh				&&	\
-	sh /tmp/get-docker.sh												&&	\
 
 # preferences
     mkdir -m 700 /mnt/data                                              &&  \
 
 # cleanup and space saving
-    apt-get clean                                                       &&  \
-    for dir in /var/lib/{apt/lists,aptitude} /tmp /var/tmp; do              \
-        [[ -d "$dir" ]] || continue;                                        \
-        find "$dir" -mindepth 1 -print -delete;                             \
-    done
-
-
-# sync
-COPY --chown=0:0 sync /cathedral
+    clean-dock
 
 
 # scripts
@@ -49,8 +37,15 @@ VOLUME /mnt/data
 #    CMD [ "curl", "--header", "X-Intent: Watchdog", "http://localhost/" ]
 
 
+# environment
+ENV \
+    DELAY=60 \
+    QUIET=false \
+    HURRY=false
+
+
 # run!
-ENV DELAY=60
+ENV ROOT=true
 CMD ["/usr/local/bin/launch"]
 
 

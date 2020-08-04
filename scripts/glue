@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC2043
+# shellcheck disable=SC2153
 _scriptname="glue"
 set -eu
 
@@ -8,18 +10,42 @@ source /cathedral/src/lib/shellfunc
 source /cathedral/src/lib/bashdb
 
 
+# options: true/false
+for v in QUIET HURRY; do
+	case "${!v,,}" in
+		true) printf -v "$v" 'true' ;;
+		false) printf -v "$v" 'false' ;;
+		*)
+			sf_println2 "Invalid value for \$${v}"
+			sf_println2 "Please set sane environment variables for this container"
+			exit 1
+		;;
+	esac
+done
+
+
+# use the options
+function q { $QUIET; }
+function t
+{
+	local t="$1"
+	if $HURRY; then
+		sf_print "$(( t / 10 ))"
+	else
+		sf_print "$t"
+	fi
+}
+
+
 # printing
 color_reset="$(tput sgr0)"
 color_white="${color_reset}$(tput bold)$(tput setaf 7)"
 color_green="${color_reset}$(tput setaf 2)"
-color_yellow="${color_reset}$(tput bold)$(tput setaf 3)"
 color_red="${color_reset}$(tput bold)$(tput setaf 1)"
 function println { printf '%s\n' "$*"; }
 function print { printf '%s' "$*"; }
 function log { println "$*" >&2; }
-function log-inline { print "$*" >&2; }
-function step { log "${color_white}==> ${color_green}$*${color_reset}"; }
-function yell { log "${color_yellow}$*${color_reset}"; }
+function step { q || log "${color_white}==> ${color_green}$*${color_reset}"; }
 function error { log "${color_red}$*${color_reset}"; }
 
 
@@ -41,7 +67,7 @@ function iplist { ip address | grep -E 'inet\s' | awk '{print $2}' | sort -n; }
 join_cmd_ip_regex='[[:space:]]([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+):[0-9]+$'
 function join-token
 {
-	local m="$1"
+	local m="$1" override="${2:-false}"
 	read -r cmd < <(docker swarm join-token "${m,,}" | grep "docker swarm join" || :)
 	if ! [[ "$cmd" =~ $join_cmd_ip_regex ]]; then
 		error "Join-token generation failed!"
@@ -49,7 +75,7 @@ function join-token
 	fi
 	local join_ip="${BASH_REMATCH[1]}"
 
-	if [[ "${m,,}" = "manager" ]]; then
+	if [[ "${m,,}" = "manager" ]] || $override; then
 		# we attempt to join managers even if our ip is not up to date
 		if
 			docker node ls --format "{{ .Hostname }}${fs}{{ .ManagerStatus }}" |
@@ -76,7 +102,7 @@ function join-token
 
 	println "$cmd"
 }
-function join-token-remote-manager
+function join-token-remote
 {
 	local node
 	while read -r node; do
@@ -87,10 +113,9 @@ function join-token-remote-manager
 				$(declare -f println)
 				$(declare -f error)
 				$(declare -f log)
-				$(declare -f log-inline)
 				$(declare -f iplist)
 				$(declare -f join-token)
-				join-token manager
+				join-token $@
 			EOF
 		} | ssh "$node" && return 0
 	done < <(get_managers)
@@ -111,6 +136,34 @@ function resolve
 }
 
 
+# sync manager status
+function glue-manager-get
+{
+	local node="$1" value="$2" id
+	while IFS="$fs" read -r id; do
+		if docker node inspect "$id" | jq -r '.[].Spec.Labels."glue-manager"' | grep -q "^${value}$"; then
+			return 0
+		fi
+	done < <(
+		docker node ls --format "{{ .ID }}${fs}{{ .Hostname }}" |
+		grep "${fs}${node}$" |
+		cut -d "$fs" -f 1
+	)
+	return 1
+}
+function glue-manager-set
+{
+	local node="$1" value="$2" id
+	while IFS="$fs" read -r id; do
+		silence docker node update --label-add "glue-manager=${value}" "$id"
+	done < <(
+		docker node ls --format "{{ .ID }}${fs}{{ .Hostname }}" |
+		grep "${fs}${node}$" |
+		cut -d "$fs" -f 1
+	)
+}
+
+
 # data store
 hostname="$(hostname -s)"
 datadir="${DATA:-"${HOME}/.${_scriptname}"}"
@@ -128,7 +181,7 @@ function db
 
 # db helpers
 function get_nodes { db nodes keys -h | while read -r node; do get_name "$node"; done; }
-function del_node { db nodes delete -k "$1"; }
+function del_node { db nodes delete -k "$1" 2>/dev/null || :; }
 function get_managers { db nodes search -c role -r '[Mm]anager' -h | while read -r node; do get_name "$node"; done; }
 function get_role { db nodes get -k "$1" -c "role" -h; }
 function set_role { db nodes set -k "$1" -c "role" -v "${2:-}"; }
@@ -144,7 +197,7 @@ function get_remote { db nodes get -k "$1" -c "remote" -h; }
 function set_remote { db nodes set -k "$1" -c "remote" -v "${2:-}"; }
 function get_var { db variables get -k "$1" -h; }
 function set_var { db variables set -k "$1" -v "${2:-}"; }
-function del_var { db variables delete -k "$1"; }
+function del_var { db variables delete -k "$1" 2>/dev/null || :; }
 
 
 # field separator
@@ -158,7 +211,7 @@ step "SSH key"
 sshkey="${datadir}/id_rsa"
 sshkeyname="swarm-glue@${hostname}"
 if [[ -e "$sshkey" ]]; then
-	log "Existing key found"
+	q || log "Existing key found"
 else
 	ssh-keygen -t rsa -b 4096 -N '' -f "$sshkey" -C "$sshkeyname"
 fi
@@ -174,7 +227,7 @@ function svc_list
 }
 function svc_reap
 {
-	local name="$1"
+	local name="$1" timeout="${2:-300}"
 	local id
 	read -r id < <(svc_list "$name") || :
 	[[ -n "$id" ]] || return 0
@@ -184,7 +237,7 @@ function svc_reap
 	created="$(date --date "${created%" "*}" '+%s')"
 	local now
 	now="$(date '+%s')"
-	if (( created + 300 < now )); then
+	if (( created + timeout < now )); then
 		log "Reaping old ${name} service: $id"
 		silence docker service rm "$id" || :
 	fi
@@ -207,18 +260,24 @@ function ssh
 	else
 		cmd="$(base64 -w0)"
 	fi
-	timeout -s9 60 ssh \
-		-n \
-		-i "$sshkey" \
-		-o GlobalKnownHostsFile=/dev/null \
-		-o UserKnownHostsFile="${datadir}/ssh_known_hosts" \
-		-o CheckHostIp=no \
-		-o StrictHostKeyChecking=no \
-		-o HashKnownHosts=no \
-		-o PreferredAuthentications=publickey \
-		-o HostKeyAlias="$node" \
-		-l root \
-		"$ip" "echo '$cmd' | base64 -d | /usr/bin/env bash"
+	if
+		timeout -s9 60 ssh \
+			-n \
+			-i "$sshkey" \
+			-o GlobalKnownHostsFile=/dev/null \
+			-o UserKnownHostsFile="${datadir}/ssh_known_hosts" \
+			-o CheckHostIp=no \
+			-o StrictHostKeyChecking=no \
+			-o HashKnownHosts=no \
+			-o PreferredAuthentications=publickey \
+			-o HostKeyAlias="$node" \
+			-l root \
+			"$ip" "echo '$cmd' | base64 -d | /usr/bin/env bash"
+	then
+		return 0
+	else
+		return 1
+	fi
 }
 function rpc
 {
@@ -248,7 +307,7 @@ function rpc
 			chmod 600 "$cronfile"
 			echo "$script" | base64 -d >"$scriptfile"
 			cat >"$cronfile" <<-END
-				* * * * * root /bin/sh -l -c "cd /; rm '$cronfile'; '$scriptfile'; rm '$scriptfile'" >"/${outfile}" 2>&1
+				* * * * * root /bin/bash -l -c "cd /; rm '$cronfile'; '$scriptfile'; rm '$scriptfile'" >"/${outfile}" 2>&1
 			END
 			while [ -e "$scriptfile" ]; do sleep 1; done
 			echo "-- Begin RPC log --"
@@ -262,7 +321,7 @@ function rpc
 	# wait for previous
 	local waited=false
 	while svc_list "$svc_name" | xargs -r docker service ps --format "{{ .CurrentState }}" 2>/dev/null | grep -iq "^Running"; do
-		if ! waited; then
+		if ! $waited; then
 			log "Waiting for previous RPC call to complete"
 			waited=true
 		fi
@@ -271,17 +330,18 @@ function rpc
 	done
 
 	# cleanup
-	svc_list "$svc_name" | xargs -r docker service rm >/dev/null
+	svc_list "$svc_name" | xargs -r docker service rm >/dev/null 2>&1
 
 	# run new
 	log "Running RPC service"
 	silence docker service create \
+		--detach \
 		--name "$svc_name" \
 		--constraint "node.hostname==$node" \
 		--replicas 1 \
 		--restart-condition none \
 		--mount "type=bind,source=/,destination=/host" \
-		alpine /bin/sh -c "echo $script | base64 -d | /bin/sh"
+		"$IMAGE" /bin/bash -c "echo $script | base64 -d | /bin/bash"
 
 	# wait for the call
 	log "Waiting for the RPC call to complete"
@@ -309,7 +369,7 @@ lock_svc_name="Swarm-Glue_LOCK"
 function swarm-lock
 {
 	local text
-	text="$(tr -d "\r\n\\\'" <<<"$*")"
+	text="$(tr -d '\r\n' <<<"$*")"
 
 	log "Attempting to create lock service, so only one node attempts this at a time"
 
@@ -327,14 +387,13 @@ function swarm-lock
 	fi
 
 	if
-		{
-			! docker service create \
-				--name "$lock_svc_name" \
-				--constraint "node.hostname!=${hostname}" \
-				--replicas 1 \
-				--restart-condition none \
-				alpine /bin/sh -c "echo '$text'; sleep 300"
-		} >/dev/null 2>&1
+		! silence docker service create \
+			--detach \
+			--name "$lock_svc_name" \
+			--constraint "node.hostname!=${hostname}" \
+			--replicas 1 \
+			--restart-condition none \
+			"$IMAGE" /bin/bash -c "echo '$text'; sleep 300"
 	then
 		error "Failed to create lock service - maybe another node grabbed it first"
 		return 1
@@ -374,13 +433,13 @@ function swarm-unlock
 ################################################################################
 step "Services"
 if silence docker container ls; then
-	log "Docker service running"
+	q || log "Docker service running"
 else
 	log "Docker service is not operational. Abort mission!"
 	exit 1
 fi
 if silence avahi-browse --all --parsable --no-db-lookup --terminate; then
-	log "Avahi is operational"
+	q || log "Avahi is operational"
 else
 	log "Avahi is broken :("
 	exit 1
@@ -408,7 +467,7 @@ function swarm_online_remote
 }
 step "Verifying swarm status"
 if swarm_online; then
-	log "Swarm online"
+	q || log "Swarm online"
 elif swarm_online_remote; then
 	log "Swarm is online remotely"
 else
@@ -426,7 +485,7 @@ function iptest
 	# grab the saved ip
 	local saved_ip
 	if saved_ip="$(get_var ip)"; then
-		log "Cached IP: $saved_ip"
+		q || log "Cached IP: $saved_ip"
 	fi
 
 	# grab node address from docker
@@ -449,16 +508,16 @@ function iptest
 	now="$(sf_unixtime)"
 	local ipcheck
 	if ! ipcheck="$(get_var ipcheck)" || (( ipcheck <= now )); then
-		log "Refreshing join-token IP"
+		q || log "Refreshing join-token IP"
 		if
-			[[ "$(join-token manager 2>/dev/null || :)" =~ $join_cmd_ip_regex ]] &&
+			[[ "$(join-token worker 2>/dev/null || :)" =~ $join_cmd_ip_regex ]] &&
 			[[ "${BASH_REMATCH[1]}" != "$saved_ip" ]]
 		then
 			saved_ip="${BASH_REMATCH[1]}"
 			set_var ip "$saved_ip"
 			log "New IP saved: $saved_ip"
 		fi
-		set_var ipcheck "$((now+600))"
+		set_var ipcheck "$(( now + $(t 600) ))"
 	fi
 
 	# complain if the saved ip isn't on any interface
@@ -498,10 +557,10 @@ function ip_redirect
 	local node
 	while read -r node; do
 		local node_ip
-		log-inline "Node: $node - "
+		local header="Node: $node -"
 
 		if ! node_ip="$(resolve "$node")"; then
-			log "Unable to resolve IP"
+			log "$header Unable to resolve IP"
 			continue
 		fi
 
@@ -516,7 +575,7 @@ function ip_redirect
 		done < <(iplist)
 		
 		if [[ -z "$redirect_ip" ]]; then
-			log "No matching IP to redirect - node seems to be in a remote network..?"
+			log "$header No matching IP to redirect - node seems to be in a remote network..?"
 			continue
 		fi
 
@@ -527,14 +586,14 @@ function ip_redirect
 		fi
 
 		if [[ "$state" = "inactive" ]] && [[ "$(get_forwarding "$node" || :)" = "$state" ]]; then
-			log "cached (${state})"
+			q || log "$header cached (${state})"
 			continue
 		else
 			set_forwarding "$node" # make sure this gets unset, even if the RPC doesn't complete successfully
 		fi
 
 		if ! ssh "$node" "date" >/dev/null 2>&1; then
-			log "SSH connection rejected"
+			log "$header SSH connection rejected"
 			continue
 		fi
 
@@ -574,7 +633,7 @@ function ip_redirect
 					esac
 				done
 			EOF
-		} | silence ssh "$node" && set_forwarding "$node" "$state" && log "iptables updated (${state})" || :
+		} | silence ssh "$node" && set_forwarding "$node" "$state" && log "$header iptables updated (${state})" || :
 	done < <(get_managers)
 }
 ip_redirect
@@ -590,27 +649,29 @@ function recover_swarm
 			step "Considering swarm recovery measures (offline swarm)"
 			log "Swarm is back online"
 			del_var rejoin
+			del_var recreate
 		fi
 	else
 		step "Considering swarm recovery measures (offline swarm)"
 		if docker node ls 2>&1 >/dev/null | grep -Eq "too few managers are online"; then
 			log "Swarm leader seems AWOL"
 			if swarm_online_remote; then
-				log "Swarm is online remotely - attempting to acquire a manager join token"
+				log "Swarm is online remotely - attempting to acquire a worker join token"
 				local cmd
-				if cmd="$(join-token-remote-manager)"; then
+				if cmd="$(join-token-remote worker true)"; then
 					log "Join-token acquired successfully"
 					local now
 					now="$(sf_unixtime)"
 					local rejoin
 					if ! rejoin="$(get_var rejoin)"; then
-						rejoin="$(( now + 600 ))"
+						rejoin="$(( now + $(t 600) ))"
 						set_var rejoin "$rejoin"
 					fi
 					if (( rejoin > now )); then
 						log "Will rejoin if the swarm does not come online within $(sf_seconds2dayslong "$((rejoin-now))")"
 						return 0
 					fi
+					del_var rejoin
 					log "Command: $cmd"
 					log "Leaving and re-joining the swarm"
 
@@ -635,10 +696,38 @@ function recover_swarm
 						log "Swarm offline"
 					fi
 				else
-					log "Could not find a node willing to hand out a manager join token :("
+					log "Could not find a node willing to hand out a worker join token :("
 				fi
 			else
-				log "Swarm is offline on every manager node - swarm recovery at this point will fail"
+				log "Swarm is offline on every manager node - swarm rejoin at this point would fail"
+				local m_count=0 m_reachable=0
+				while read -r node; do
+					(( ++m_count ))
+					log "Trying to reach $node"
+					if ssh "$node" echo online >/dev/null; then
+						(( ++m_reachable ))
+					fi
+				done < <(get_managers)
+				log "${m_reachable}/${m_count} other managers are reachable"
+				if (( m_reachable > ((m_count + 1) / 2) )); then
+					log "Enough managers are reachable. The swarm should be up, but it isn't"
+					local now
+					now="$(sf_unixtime)"
+					local recreate
+					if ! recreate="$(get_var recreate)"; then
+						recreate="$(( now + $(t 1200) + RANDOM%$(t 1200) ))"
+						set_var recreate "$recreate"
+					fi
+					if (( recreate > now )); then
+						log "Will FORCE a new swarm cluster, if the swarm does not come online within $(sf_seconds2dayslong "$((recreate-now))")"
+						return 0
+					fi
+					del_var recreate
+					log "Re-creating the cluster. Situation is bad :("
+					docker swarm init --force-new-cluster
+				else
+					log "Not enough :("
+				fi
 			fi
 		else
 			log "No idea what's wrong with the swarm :("
@@ -686,7 +775,7 @@ function recover_swarm
 
 		log "Attempting to acquire a manager join token"
 		local cmd
-		if cmd="$(join-token-remote-manager)"; then
+		if cmd="$(join-token-remote manager)"; then
 			log "Command: $cmd"
 			log "Leaving and re-joining the swarm"
 			docker swarm leave --force 2>/dev/null || :
@@ -731,9 +820,9 @@ function remote_access
 
 	local node
 	while read -r node; do
-		log-inline "Node: $node - "
+		local header="Node: $node -"
 		if ! resolve "$node" >/dev/null; then
-			log "NOT FOUND"
+			log "$header NOT FOUND"
 			log "Warning: Unable to resolve $node"
 			continue
 		fi
@@ -741,15 +830,15 @@ function remote_access
 		now="$(sf_unixtime)"
 		local remote
 		if remote="$(get_remote "$node")" && (( remote > now )); then
-			log "OK (cached)"
+			q || log "$header OK (cached)"
 			continue
 		fi
 		if ssh "$node" "date" >/dev/null 2>&1; then
-			log "OK"
-			set_remote "$node" "$(( now + 600 ))"
+			q || log "$header OK"
+			set_remote "$node" "$(( now + $(t 600) ))"
 			continue
 		fi
-		log "ACCESS DENIED"
+		log "$header ACCESS DENIED"
 		log "Attempting to gain access..."
 		{
 			cat <<-"EOF"
@@ -807,8 +896,8 @@ function new_nodes
 	local now
 	now="$(sf_unixtime)"
 
-	local node s m
-	while IFS="$fs" read -r node s m; do
+	local id node s m
+	while IFS="$fs" read -r id node s m; do
 		[[ "$s" = "Ready" ]] || continue
 		[[ "$node" != "${hostname}" ]] || continue
 		[[ -n "$m" ]] && m="Manager" || m="Worker"
@@ -819,13 +908,32 @@ function new_nodes
 			continue
 		elif get_role "$node" >/dev/null; then
 			log "Swarm member changed status: $node => $m"
-			set_role "$node" "$m"
+			if [[ "$m" = "Worker" ]]; then
+				log "Checking if this was intended..."
+				if glue-manager-get "$node" true; then
+					log "It's supposed to be a manager!"
+					local lock_id
+					if ! lock_id="$(swarm-lock "${hostname} is promoting ${node} to a swarm manager...")"; then
+						return 0 # return - there's no point in trying the next one if someone else is already at it
+					fi
+					glue-manager-set "$node" true
+					if silence docker node promote "$id"; then
+						log "Promoted $node to manager status"
+					fi
+					swarm-unlock "$lock_id"
+				else
+					log "I don't think that's supposed to be a manager... Saving new status!"
+					set_role "$node" "$m"
+				fi
+			else
+				set_role "$node" "$m"
+			fi
 		else
 			log "New swarm member ready: $node"
 			set_name "$node" "$node"
 			set_role "$node" "$m"
 		fi
-	done < <(docker node ls --format "{{ .Hostname }}${fs}{{ .Status }}${fs}{{ .ManagerStatus }}")
+	done < <(docker node ls --format "{{ .ID }}${fs}{{ .Hostname }}${fs}{{ .Status }}${fs}{{ .ManagerStatus }}")
 
 	get_nodes | sf_buffer | while read -r node; do
 		seen="$(get_seen "$node")"
@@ -874,17 +982,17 @@ function lost_soul_invite
 		fi
 
 		log "Node is not ready: $node"
-		log-inline "Remote access: "
+		local header="Remote access:"
 		if ! resolve "$node" >/dev/null; then
-			log "NOT FOUND"
+			log "$header NOT FOUND"
 			log "Warning: Unable to resolve $node"
 			continue
 		fi
 		if ! ssh "$node" "date" >/dev/null 2>&1; then
-			log "FAIL"
+			log "$header FAIL"
 			continue
 		fi
-		log "OK"
+		log "$header OK"
 
 		local m
 		if ! m="$(get_role "$node")"; then
@@ -897,9 +1005,9 @@ function lost_soul_invite
 		local ts
 		if ! ts="$(get_reinclude "$node")"; then
 			if [[ "${m,,}" = "manager" ]]; then
-				ts="$((now + 900))" # managers should take care of themselves, really, but we'll help them eventually
+				ts="$(( now + $(t 900) ))" # managers should take care of themselves, really, but we'll help them eventually
 			else
-				ts="$((now + 300))" # workers are dumb
+				ts="$(( now + $(t 300) ))" # workers are dumb
 			fi
 			set_reinclude "$node" "$ts"
 		fi
@@ -908,19 +1016,26 @@ function lost_soul_invite
 			continue
 		fi
 
-		log "Attempting re-inclusion as ${m,,}"
+		log "Attempting re-inclusion of ${m,,}"
 
 		local lock_id
 		if ! lock_id="$(swarm-lock "${hostname} is re-including ${node} in the swarm...")"; then
 			return 0 # return - there's no point in trying the next one if someone else is already at it
 		fi
 
+		local override
+		if [[ "${m,,}" = "manager" ]]; then
+			override=true
+		else
+			override=false
+		fi
+
 		local cmd
-		if read -r cmd < <(join-token "${m,,}" "$node"); then
+		if read -r cmd < <(join-token "${m,,}" "$override"); then
 			log "Command: $cmd"
 			if [[ "${m,,}" = "manager" ]]; then
-				# we don't force managers to leave the swarm
-				ssh "$node" "docker swarm leave 2>/dev/null; $cmd" || :
+				# we don't force managers to leave the swarm... that quickly
+				ssh "$node" "docker swarm leave 2>/dev/null || docker node ls >/dev/null 2>&1 || docker swarm leave --force 2>/dev/null; $cmd" || :
 			else
 				# on workers, we can force leave
 				ssh "$node" "docker swarm leave --force 2>/dev/null; $cmd" || :
@@ -934,6 +1049,32 @@ lost_soul_invite
 
 
 ################################################################################
+# Manager tag                                                                  #
+################################################################################
+function manager_tag
+{
+	step "Manager tag"
+	if ! swarm_online 2>/dev/null; then
+		log "Swarm offline"
+		return 0
+	fi
+	local now gm
+	now="$(sf_unixtime)"
+	if ! gm="$(get_var glue-manager)" || (( gm <= now )); then
+		if silence docker node update --label-add 'glue-manager=true' "$hostname"; then
+			set_var gm "$(( now + $(t 3600) ))"
+			q || log "Updated"
+		else
+			log "Update failed"
+		fi
+	else
+		q || log "OK (cached)"
+	fi
+}
+manager_tag
+
+
+################################################################################
 # Clean up duplicate nodes and other swarm trash                               #
 ################################################################################
 function cleanup
@@ -944,30 +1085,43 @@ function cleanup
 		return 0
 	fi
 
-	local readies
-	mapfile -t readies < <(docker node ls --format "{{ .Hostname }}${fs}{{ .Status }}" | grep "${fs}Ready$" | cut -d "$fs" -f 1)
-	docker node ls --format "{{ .Hostname }}${fs}{{ .Status }}${fs}{{ .ID }}" |
-		grep -v "${fs}Ready${fs}" |
-		while IFS="$fs" read -r node s id; do
-			if sf_inarray "$node" "${readies[@]}"; then
-				log "$node has duplicate ID: $id"
+	local list
+	list=$(docker node ls --format "{{ .ID }}${fs}{{ .Hostname }}${fs}{{ .Status }}" | base64 -w0)
+	local id node s
+	while IFS="$fs" read -r id node s; do
+		[[ "$s" != "Ready" ]] || continue
+		if base64 -d <<<"$list" | grep -v "^${id}${fs}" | grep -q "${fs}${node}${fs}Ready$"; then
+			log "$node has duplicate ID: $id"
 
-				if ! lock_id="$(swarm-lock "${hostname} is removing duplicate ID ${id} from the swarm...")"; then
-					return 0 # return - there's no point in trying the next one if someone else is already at it
+			if ! lock_id="$(swarm-lock "${hostname} is removing duplicate ID ${id} from the swarm...")"; then
+				return 0 # return - there's no point in trying the next one if someone else is already at it
+			fi
+
+			if ! docker node ls --format "{{ .ID }}" | grep -q "^${id}$"; then
+				log "Already removed by someone else... Meh."
+			else
+				if glue-manager-get "$node" true; then
+					glue-manager-set "$node" true
 				fi
-
 				docker node demote "$id" 2>/dev/null || :
 				if silence docker node rm --force "$id"; then
 					log "Duplicate successfully removed from swarm"
 				fi
-
-				swarm-unlock "$lock_id"
 			fi
-		done
+
+			swarm-unlock "$lock_id"
+		fi
+	done < <(base64 -d <<<"$list")
 	
 	step "Cleaning up void nodes"
 	local now
 	now="$(sf_unixtime)"
+
+	step "Cleaning up stale RPC services"
+	get_nodes | while read -r node; do
+		local svc_name="${node}_RPC"
+		svc_reap "$svc_name" 900
+	done
 
 	# recover online nodes
 	local id
@@ -986,7 +1140,7 @@ function cleanup
 			[[ -z "$node" ]] || continue
 			[[ "$s" = "Unknown" ]] || continue
 			if ! ts="$(db garbage get -k "$id")"; then
-				ts="$((now + 600))"
+				ts="$(( now + $(t 600) ))"
 				db garbage set -k "$id" -v "$ts"
 			fi
 		done

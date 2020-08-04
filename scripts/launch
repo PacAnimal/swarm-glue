@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC2043
+# shellcheck disable=SC2153
 set -eu
 
 
@@ -6,13 +8,49 @@ set -eu
 source /cathedral/src/lib/shellfunc
 
 
-# variable variables
+# options: integers
+for v in DELAY; do
+	if ! sf_integer -- "${!v}"; then
+		sf_println2 "Invalid value for \$${v}"
+		sf_println2 "Please set sane environment variables for this container"
+		exit 1
+	fi
+done
+
+
+# options: true/false
+for v in QUIET; do
+	case "${!v,,}" in
+		true) printf -v "$v" 'true' ;;
+		false) printf -v "$v" 'false' ;;
+		*)
+			sf_println2 "Invalid value for \$${v}"
+			sf_println2 "Please set sane environment variables for this container"
+			exit 1
+		;;
+	esac
+done
+
+
+# use the options
 delay="$DELAY"
+if $HURRY; then
+	(( delay /= 10 ))
+fi
+function q { $QUIET; }
+
+
+# environment variable list
+envvars=(
+	"DELAY=$DELAY"
+	"QUIET=$QUIET"
+	"HURRY=$HURRY"
+)
 
 
 # printing
 if ! tput sgr0 >/dev/null 2>&1; then
-	export TERM="xterm"
+	export TERM="ansi"
 fi
 color_reset="$(tput sgr0)"
 color_white="${color_reset}$(tput bold)$(tput setaf 7)"
@@ -25,40 +63,106 @@ function yell { log "${color_white}$*${color_reset}"; }
 function error { log "${color_red}$*${color_reset}"; }
 
 
+# child detection hack to support old deployments
+if [[ -e "/run/avahi-daemon" ]]; then
+	GLUE_CHILD=true
+fi
+
+
 # sanity
+paths=( "/var/run/docker.sock" )
+if ${GLUE_CHILD:-false}; then
+	paths+=( "/var/run/dbus" )
+	paths+=( "/run/avahi-daemon" )
+fi
 error=false
-paths=(
-	"/var/run/docker.sock"
-	"/var/run/dbus"
-	"/run/avahi-daemon"
-)
 for path in "${paths[@]}"; do
 	if ! [[ -e "$path" ]]; then
 		error "Missing mount point: $path"
 		error=true
 	fi
 done
-read -r ipcount < <(ip address | grep -Ec "inet6?")
-if (( ipcount < 3 )); then
-	error "Found suspiciously few IP addresses on the system - did you forget '--network host'?"
-	error=true
-fi
 if $error; then
-	error "Here's a suggested line to deploy swarm-glue on a Debian based system:"
-	log "$ docker pull b01t/swarm-glue:armhf && docker run -d --name swarm-glue --restart unless-stopped -v /var/run/docker.sock:/var/run/docker.sock -v /var/run/dbus:/var/run/dbus -v /run/avahi-daemon:/run/avahi-daemon --network host -v swarm-glue:/mnt/data b01t/swarm-glue:armhf"
+	error "Here's a suggested docker stack file to deploy swarm-glue in a Debian-based environment:"
+	log "$(base64 -d <<<"dmVyc2lvbjogIjMuNyIKc2VydmljZXM6CiAgICBnbHVlOgogICAgICAgIGltYWdlOiBiMDF0L3N3YXJtLWdsdWU6YXJtaGYKICAgICAgICB2b2x1bWVzOgogICAgICAgICAgICAtIC92YXIvcnVuL2RvY2tlci5zb2NrOi92YXIvcnVuL2RvY2tlci5zb2NrCiAgICAgICAgZGVwbG95OgogICAgICAgICAgICBtb2RlOiBnbG9iYWwKCgojIHZpbTogdGFic3RvcD00OnNvZnR0YWJzdG9wPTQ6c2hpZnR3aWR0aD00OmV4cGFuZHRhYgo=")"
 	exit 1
 fi
 
+# a bit of soul searching
+uuid_file="/dev/shm/soul.id"
+uuid=$(uuidgen | tee "$uuid_file")
+echo "UUID: $uuid"
+while IFS='|' read -r id name image; do
+	echo -n "Search: $name => "
+	if docker exec "$id" grep "^${uuid}$" "$uuid_file" >/dev/null 2>&1; then
+		echo "Yep"
+		break
+	else
+		echo "Nope!"
+		unset id
+	fi
+done < <(docker container ls --no-trunc --format '{{.ID}}|{{.Names}}|{{.Image}}')
+if [[ -z "${id:-}" ]]; then
+	echo "Failed to find myself :(" >&2
+	exit 1
+fi
+echo "My container ID is: $id"
+read -r image < <(docker container inspect "$id" --format '{{.Config.Image}}')
+if [[ -z "$image" ]]; then
+	echo "Unable to determine the config image of the container :(" >&2
+	exit 1
+fi
+echo "I am running $image"
+export IMAGE=$image
 
-# loop
-while true; do
-	step "Applying swarm glue"
-	yell "$(sf_timestamp)"
-	glue && code=$? || code=$?
-	yell "Glue exit code: $code"
-	yell "Sleeping for ${delay} seconds"
-	sleep "$delay" || exit $?
-done
+
+# start child?
+if ! ${GLUE_CHILD:-false}; then
+	while true; do
+		if
+			docker container ls --format '{{.Names}}' | grep -q '^swarm-glue$' &&
+			docker container inspect swarm-glue --format '{{.Config.Image}}' | grep -q "$IMAGE"
+		then
+			log "Glue container exists with the correct image"
+		else
+			log "Deploying glue container"
+			docker container stop swarm-glue >/dev/null 2>&1 || :
+			docker container rm swarm-glue >/dev/null 2>&1 || :
+			opts=()
+			for var in "${envvars[@]}"; do
+				opts+=( '-e' "$var" )
+			done
+			docker run -d \
+				"${opts[@]}" \
+				--name swarm-glue \
+				--restart unless-stopped \
+				--network host \
+				-v /var/run/docker.sock:/var/run/docker.sock \
+				-v /var/run/dbus:/var/run/dbus \
+				-v /run/avahi-daemon:/run/avahi-daemon \
+				-v swarm-glue:/mnt/data \
+				-e GLUE_CHILD=true \
+				"$IMAGE"
+		fi
+		sf_sleep 600
+	done
+else
+	! q || log "Running in QUIET mode"
+	while true; do
+		if q && (( SECONDS >= ${next:-0} )); then
+			log "$(sf_timestamp) - Still Alive"
+			next="$(( SECONDS + 3600 ))"
+		fi
+		q || step "Applying swarm glue"
+		q || yell "$(sf_timestamp)"
+		timeout -s9 600 glue && code=$? || code=$?
+		if (( code )) || ! q; then
+			yell "Glue exit code: $code"
+		fi
+		q || yell "Sleeping for ${delay} seconds"
+		sf_sleep "$delay" || exit $?
+	done
+fi
 
 
 
